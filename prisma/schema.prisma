@@ -1,0 +1,119 @@
+/// What this file does:
+/// Defines the persistent schema for users, sessions, knowledge entries, tags, and audit logs.
+/// What calls it:
+/// Prisma Client generation plus every repository under src/repositories.
+/// What it calls:
+/// This file is the persistence contract and does not depend on application code.
+/// One thing a junior engineer would likely get wrong when writing something similar:
+/// Hiding workflow and ranking state in flexible JSON instead of modeling them as explicit fields and enums.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  VIEWER
+  EDITOR
+  ADMIN
+}
+
+enum EntryStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model User {
+  id              String           @id @default(cuid())
+  email           String           @unique
+  name            String
+  passwordHash    String
+  role            UserRole
+  sessions        Session[]
+  authoredEntries KnowledgeEntry[] @relation("EntryAuthor")
+  auditLogs       AuditLog[]       @relation("AuditActor")
+  curatedEntries  KnowledgeEntry[] @relation("EntryCurator")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([role])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model KnowledgeEntry {
+  /// ⚠️ SENIOR NOTE: Ranking and workflow fields live on the entry itself so search ordering and editorial policy stay queryable and auditable.
+  id             String              @id @default(cuid())
+  slug           String              @unique
+  title          String
+  summary        String
+  content        String
+  status         EntryStatus         @default(DRAFT)
+  manualBoost    Int                 @default(0)
+  isFeatured     Boolean             @default(false)
+  curationNotes  String?
+  authorId       String
+  curatedById    String?
+  publishedAt    DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  author         User                @relation("EntryAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  curatedBy      User?               @relation("EntryCurator", fields: [curatedById], references: [id], onDelete: SetNull)
+  tags           KnowledgeEntryTag[]
+  auditLogs      AuditLog[]          @relation("EntryAuditTarget")
+
+  @@index([authorId, status])
+  @@index([status, publishedAt])
+  @@index([isFeatured, manualBoost])
+}
+
+model Tag {
+  id        String              @id @default(cuid())
+  name      String
+  slug      String              @unique
+  createdAt DateTime            @default(now())
+  entries   KnowledgeEntryTag[]
+
+  @@unique([name])
+}
+
+model KnowledgeEntryTag {
+  entryId String
+  tagId   String
+  entry   KnowledgeEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  tag     Tag            @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([entryId, tagId])
+  @@index([tagId])
+}
+
+model AuditLog {
+  id          String          @id @default(cuid())
+  action      String
+  targetType  String
+  targetId    String
+  actorId     String?
+  entryId     String?
+  metadata    Json?
+  createdAt   DateTime        @default(now())
+  actor       User?           @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  targetEntry KnowledgeEntry? @relation("EntryAuditTarget", fields: [entryId], references: [id], onDelete: SetNull)
+
+  @@index([targetType, targetId])
+  @@index([entryId])
+  @@index([actorId, createdAt])
+}
