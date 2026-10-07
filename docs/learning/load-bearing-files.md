@@ -1,57 +1,84 @@
 # Load-Bearing Files
 
-## src/services/knowledgeEntryService.ts
-- What it does: Centralizes business rules for search, creation, update, workflow transitions, curation, and audit logging.
-- What calls it: `src/app/api/knowledge/search/route.ts`, `src/app/api/knowledge/route.ts`, `src/app/api/knowledge/[entryId]/route.ts`, `src/app/api/knowledge/[entryId]/status/route.ts`, `src/app/api/knowledge/[entryId]/curation/route.ts`, and `src/app/entries/[slug]/page.tsx`.
-- What it calls: `src/repositories/knowledgeEntryRepository.ts`, `src/repositories/tagRepository.ts`, `src/repositories/auditLogRepository.ts`, and `src/lib/auth/permissions.ts`.
-- What would break or become insecure if this file were wrong: Editors could mutate entries they do not own, invalid status changes could slip through, and audit events could drift away from the write transaction.
-- What a junior engineer would likely miswrite here: Splitting permission checks across route handlers and services so the true policy becomes impossible to audit.
+These are the files where a small mistake leaks drafts, hands out admin powers, or corrupts search. For each one: who calls it (checked by import search), what breaks, a likely junior mistake, and one current weakness with a line reference.
 
-## src/repositories/knowledgeEntryRepository.ts
-- What it does: Owns entry reads/writes, the ownership-scoped workspace query, and the PostgreSQL ranking query.
-- What calls it: `src/services/knowledgeEntryService.ts`.
-- What it calls: `src/lib/db.ts`.
-- What would break or become insecure if this file were wrong: Search ranking would become incorrect, or draft visibility could leak across users if the author filter disappeared.
-- What a junior engineer would likely miswrite here: Putting service logic into the repository or forgetting that public search must only return `PUBLISHED` rows.
+## `src/services/knowledgeEntryService.ts` (232 lines)
 
-## src/lib/auth/permissions.ts
-- What it does: Defines role thresholds, ownership rules, and valid workflow transitions.
-- What calls it: `src/lib/auth/apiAuth.ts` and `src/services/knowledgeEntryService.ts`.
-- What it calls: Nothing outside generated Prisma enums.
-- What would break or become insecure if this file were wrong: RBAC and workflow integrity would drift everywhere at once because multiple services depend on it.
-- What a junior engineer would likely miswrite here: Checking only role and not ownership, especially for unpublished entries.
+- **What it does:** It holds every entry use case: search pass-through, published read, workspace read and list, create, update, status change, and curation. Every write runs inside `db.$transaction` together with an audit row.
+- **What calls it:** the knowledge API routes (search, root, `[entryId]`, status, curation, workspace) and `src/app/entries/[slug]/page.tsx` (`getPublishedEntryBySlug`).
+- **What it calls:** `knowledgeEntryRepository`, `tagRepository`, `auditLogRepository`, and six helpers from `permissions.ts`.
+- **What breaks if wrong:** Editors could mutate entries they do not own, invalid transitions could slip through, or audit rows could commit separately from the change they describe.
+- **Likely junior mistake:** Splitting policy across routes and services.
+- **Current weakness:** `updateDraftEntry` (`:121-161`) never checks `status`, so published content can be edited in place. Slug uniqueness is checked outside the transaction (`:88`, `:132`).
 
-## src/lib/auth/session.ts
-- What it does: Resolves cookie sessions into server-trusted users and expires stale sessions.
-- What calls it: `src/app/page.tsx`, `src/app/login/page.tsx`, `src/app/workspace/page.tsx`, and `src/lib/auth/apiAuth.ts`.
-- What it calls: `src/repositories/sessionRepository.ts` and `src/lib/env.ts`.
-- What would break or become insecure if this file were wrong: Deleted or expired sessions could continue to authenticate requests.
-- What a junior engineer would likely miswrite here: Trusting the cookie alone instead of verifying the database-backed session row.
+## `src/repositories/knowledgeEntryRepository.ts` (425 lines)
 
-## src/lib/validation/knowledgeEntrySchemas.ts
-- What it does: Defines the Zod boundary for search, entry save, status change, and curation requests.
-- What calls it: Knowledge entry API routes in `src/app/api/knowledge`.
-- What it calls: `src/lib/utils.ts` for slug normalization.
-- What would break or become insecure if this file were wrong: Invalid content shapes could cross into the service layer and produce inconsistent slugs, empty search documents, or unchecked ranking values.
-- What a junior engineer would likely miswrite here: Treating validation as a UI concern and letting route handlers accept whatever JSON arrives.
+- **What it does:** It provides scoped finders, the workspace list, ranked search SQL, the writes, and `mapWorkspaceEntry`.
+- **What calls it:** `knowledgeEntryService.ts` and `src/tests/repositories/workspace-scope.test.ts`.
+- **What it calls:** `src/lib/db.ts`.
+- **What breaks if wrong:**
+  - If the `authorId` clause at `:119` or `:89` disappears, drafts leak between editors.
+  - If `entry."status" = 'PUBLISHED'` (`:216`) disappears, drafts appear in search for everyone, viewers included.
+- **Likely junior mistake:** Building SQL with string concatenation. This file uses `Prisma.sql` and `Prisma.join` throughout.
+- **Current weakness:** The search expression does not match the GIN index (`:220-229` vs `migration.sql:112-120`).
 
-## src/app/api/knowledge/[entryId]/curation/route.ts
-- What it does: Exposes the admin-only curation mutation boundary.
-- What calls it: `useCurateEntryMutation()` in `src/hooks/useEntryMutations.ts`, which is triggered by the admin section of `src/components/knowledge/workspace-dashboard.tsx`.
-- What it calls: `requireApiRole()` in `src/lib/auth/apiAuth.ts`, `curateEntrySchema.parse()` in `src/lib/validation/knowledgeEntrySchemas.ts`, and `curateEntry()` in `src/services/knowledgeEntryService.ts`.
-- What would break or become insecure if this file were wrong: Editors could gain control over featured placement and manual search boosts.
-- What a junior engineer would likely miswrite here: Checking admin status in the React component and forgetting to enforce it on the server.
+## `src/lib/auth/permissions.ts` (91 lines)
 
-## src/components/knowledge/workspace-dashboard.tsx
-- What it does: Drives the editorial UI for create/edit/publish/archive/curate flows.
-- What calls it: `src/app/workspace/page.tsx`.
-- What it calls: `src/hooks/useWorkspaceEntries.ts`, `src/hooks/useWorkspaceEntry.ts`, and `src/hooks/useEntryMutations.ts`.
-- What would break or become insecure if this file were wrong: The UI could present stale state or send incomplete mutation payloads, even if the backend still rejects bad operations.
-- What a junior engineer would likely miswrite here: Re-implementing permission logic in the component instead of reflecting server state.
+- **What it does:** It defines the role thresholds, ownership predicates, and the transition matrix.
+- **What calls it:** `apiAuth.ts` (`hasMinimumRole`) and `knowledgeEntryService.ts`.
+- **What it calls:** Prisma enums only.
+- **What breaks if wrong:** RBAC and the workflow drift everywhere at once.
+- **Likely junior mistake:** Checking the role without checking ownership.
+- **Current weakness:** Same-status transitions are "valid" (`:79-81`). `canAccessWorkspace` is dead code (`:30-32`).
 
-## prisma/schema.prisma
-- What it does: Defines all persistent entities, enums, and relations.
-- What calls it: Prisma Client generation and every repository in `src/repositories`.
-- What it calls: Nothing; it is the persistence contract.
-- What would break or become insecure if this file were wrong: Search, RBAC, and audit features would not have the fields they rely on, and data relationships would become inconsistent.
-- What a junior engineer would likely miswrite here: Adding flexible JSON blobs for workflow state instead of explicit enums and fields.
+## `src/lib/auth/session.ts` (74 lines) and `src/lib/auth/apiAuth.ts` (44 lines)
+
+- **What they do:** They turn a token into an `AuthSession` (pages and APIs), expire stale sessions, and enforce 401 and 403.
+- **What calls them:** the four pages (via `getServerSession`), `apiAuth.ts`, and `authService.ts` (token and expiry helpers).
+- **What breaks if wrong:** Deleted or expired sessions keep working, or 401 and 403 get conflated.
+- **Current weakness:** Tokens are stored unhashed (`sessionRepository.ts:3-11`).
+
+## `src/lib/validation/knowledgeEntrySchemas.ts` (71 lines)
+
+- **What it does:** It defines the search, workspace, save, status, and curation contracts.
+- **What calls it:** five route files, plus `src/tests/validation/knowledge-entry-schema.test.ts` and type imports in hooks and the service.
+- **What it calls:** `slugify` (`src/lib/utils.ts:8-14`).
+- **What breaks if wrong:** Uncapped boosts would swamp text relevance. Blank slugs would create unreachable entries.
+- **Current weakness:** `featuredOnly: z.coerce.boolean()` (`:26`) parses `"false"` as `true`. `content` has no maximum length (`:42`).
+
+## `src/repositories/tagRepository.ts` (37 lines)
+
+- **What it does:** It lists tags and upserts tags from names during saves.
+- **What calls it:** `knowledgeEntryService.ts` (upsert) and `tagService.ts` (list).
+- **What breaks if wrong:** Tags get duplicated or renamed for every entry that uses them.
+- **Current weakness:** It de-duplicates by name rather than slug (`:15`). On a conflict it overwrites `name` (`:24`).
+
+## `src/app/api/knowledge/[entryId]/curation/route.ts` (37 lines)
+
+- **What it does:** It is the admin-only boundary for ranking control.
+- **What calls it:** `useCurateEntryMutation` (`src/hooks/useEntryMutations.ts:70`) and `src/tests/api/knowledge-curation-route.test.ts`.
+- **What it calls:** `requireApiRole("ADMIN")`, `curateEntrySchema`, and `curateEntry`.
+- **What breaks if wrong:** Editors could reorder public search.
+- **Likely junior mistake:** Hiding the form in the UI and skipping the server check. The UI does hide it (`workspace-dashboard.tsx:275`), and the server checks twice.
+
+## `src/components/knowledge/workspace-dashboard.tsx`
+
+- **What it does:** It drives create, edit, publish, archive, restore, and curate.
+- **What calls it:** `src/app/workspace/page.tsx:17-23`.
+- **What it calls:** `useWorkspaceEntries`, `useWorkspaceEntry`, and `useEntryMutations`.
+- **What breaks if wrong:** Nothing security-relevant, because the server re-checks everything. It can still offer impossible actions.
+- **Current weakness:** It shows Publish on archived entries (`:185`).
+
+## `prisma/schema.prisma` and the initial migration
+
+- **What they do:** The persistence contract, plus the one hand-written index.
+- **What calls them:** `prisma generate`, `migrate dev`, `db push`, and the seed.
+- **What breaks if wrong:** Search, RBAC, and audit lose the fields they depend on.
+- **Current weakness:** `npm run db:push` would build a database without `KnowledgeEntry_search_idx`.
+
+## Exercises
+
+1. **Goal:** Verify the caller lists.
+   **Check:** Search `src/` for each module path. For example, `@/services/knowledgeEntryService` should appear in six route files and one page.
+2. **Goal:** Choose the single most dangerous line deletion.
+   **Check:** Compare `knowledgeEntryRepository.ts:216` (drafts become publicly searchable), `:119` (editors see each other's drafts in the list), and `curation/route.ts:27` (editors can still not curate, because `curateEntry` re-checks at `knowledgeEntryService.ts:198-200`). The third is the least dangerous.

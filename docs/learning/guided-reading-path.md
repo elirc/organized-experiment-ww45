@@ -1,79 +1,91 @@
 # Guided Reading Path
 
-## Step 1 — src/app/page.tsx
-**Why read this:** It shows the top-level server-side entry into the authenticated search experience.
-**What to look for:** `getServerSession()` and the redirect boundary that keeps unauthenticated users out before React renders the search UI.
-**What to trace:** It calls `getServerSession()` in `src/lib/auth/session.ts` and renders `SearchDashboard` from `src/components/knowledge/search-dashboard.tsx`.
-**What a junior would likely miss:** The page itself does not fetch search data; it only establishes the session boundary and hands off to the client shell.
+There are thirteen stops. Each one ends with a **Check** you can answer with the file open. The heaviest file is `src/repositories/knowledgeEntryRepository.ts` (425 lines). Read it after you understand the auth layers.
 
-## Step 2 — src/lib/auth/session.ts
-**Why read this:** This file explains how a browser cookie becomes a server-trusted user.
-**What to look for:** `getServerSession()`, `getSessionFromToken()`, and the expired-session cleanup path.
-**What to trace:** It calls `findSessionByToken()` and `invalidateSessionByToken()` in `src/repositories/sessionRepository.ts`; pages in `src/app/page.tsx`, `src/app/login/page.tsx`, and `src/app/workspace/page.tsx` call it.
-**What a junior would likely miss:** Cookie presence is not enough; the backing session row is the source of truth.
+## Step 1: `src/app/page.tsx`
+**Why read this:** It is the server-side entry to search.
+**What to look for:** `getServerSession()`, then `redirect("/login")` when there is no session, then `<SearchDashboard session=...>` (`:6-21`). The session's `expiresAt` is serialized to an ISO string before crossing to the client.
+**What to trace:** `src/lib/auth/session.ts:30-39` and `src/components/knowledge/search-dashboard.tsx`.
+**What a junior would likely miss:** The page loads no search data. Everything after the session check happens in the client through React Query.
+**Check:** List the other pages that use the same redirect pattern. Answer: `workspace/page.tsx:9-11`, which also redirects viewers at `:13-15`, and `entries/[slug]/page.tsx:21-23`.
 
-## Step 3 — src/lib/auth/apiAuth.ts
-**Why read this:** This is the reusable API guard layer that keeps auth checks out of route bodies.
-**What to look for:** `requireApiSession()` and `requireApiRole()`.
-**What to trace:** Routes under `src/app/api/me/route.ts`, `src/app/api/knowledge/search/route.ts`, and `src/app/api/knowledge/[entryId]/curation/route.ts` call it; it calls `getSessionFromToken()` in `src/lib/auth/session.ts`.
-**What a junior would likely miss:** Distinguishing `401` from `403` is not cosmetic; it changes how clients and audits interpret failures.
+## Step 2: `src/lib/auth/session.ts`
+**Why read this:** It turns a cookie into a trusted user.
+**What to look for:** Token creation (`:20-22`), expiry (`:24-28`), and `getSessionFromToken`, which deletes expired rows (`:41-64`).
+**What to trace:** `findSessionByToken` and `invalidateSessionByToken` (`src/repositories/sessionRepository.ts:13-33`).
+**What a junior would likely miss:** The cookie value is the raw database key. There is no hashing, so a database leak equals a session leak.
+**Check:** Find what `getSessionFromToken` returns for an expired session, and what it does as a side effect. Answer: `null`, and it deletes the row (`:48-52`).
 
-## Step 4 — src/lib/auth/permissions.ts
-**Why read this:** It is the actual RBAC and ownership policy for the product.
-**What to look for:** `canEditEntry()`, `canTransitionEntry()`, `canReadEntryInWorkspace()`, and `isValidStatusTransition()`.
-**What to trace:** `src/services/knowledgeEntryService.ts` calls these helpers before mutating content; `src/lib/auth/apiAuth.ts` uses `hasMinimumRole()`.
-**What a junior would likely miss:** Role checks are only half the policy; unpublished content also needs author ownership checks.
+## Step 3: `src/lib/auth/apiAuth.ts`
+**Why read this:** It holds the route guards.
+**What to look for:** `requireApiSession` returns 401 (`:19-33`). `requireApiRole` adds the 403 threshold (`:35-44`).
+**What to trace:** All knowledge routes and `/api/me`. `/api/tags` uses neither.
+**What a junior would likely miss:** The guards resolve the session through `request.cookies`, while pages use `next/headers`. They are two readers of one cookie.
+**Check:** Count the routes that call `requireApiRole`. Answer: the knowledge `POST`, `[entryId]` `GET` and `PATCH`, status, curation, and workspace routes, which is six handlers.
 
-## Step 5 — src/lib/validation/knowledgeEntrySchemas.ts
-**Why read this:** This file is the request contract for search, mutations, workflow transitions, and curation.
-**What to look for:** The slug normalization transform and the capped `manualBoost` policy.
-**What to trace:** It is consumed by routes in `src/app/api/knowledge/search/route.ts`, `src/app/api/knowledge/route.ts`, `src/app/api/knowledge/[entryId]/status/route.ts`, and `src/app/api/knowledge/[entryId]/curation/route.ts`.
-**What a junior would likely miss:** Validation is not just about type shape; it also normalizes values the service layer depends on.
+## Step 4: `src/lib/auth/permissions.ts`
+**Why read this:** It is the actual policy.
+**What to look for:** `roleOrder` (`:20-24`), `canEditEntry` (`:42-48`), `canReadEntryInWorkspace` (`:50-60`), `canTransitionEntry` (`:62-76`), and `isValidStatusTransition` (`:78-91`).
+**What to trace:** `src/services/knowledgeEntryService.ts:13` imports six of these helpers.
+**What a junior would likely miss:** `isValidStatusTransition` returns `true` for same-status moves (`:79-81`). Re-publishing an already-published entry resets `publishedAt`.
+**Check:** Find the helper that is defined but never called. Answer: `canAccessWorkspace` (`:30-32`).
 
-## Step 6 — src/app/api/knowledge/search/route.ts
-**Why read this:** It is the cleanest example of the request boundary for a read-only endpoint.
-**What to look for:** Query parsing, `requireApiSession()`, and the handoff into the service layer.
-**What to trace:** It calls `searchEntriesQuerySchema.parse()` in `src/lib/validation/knowledgeEntrySchemas.ts` and `searchKnowledgeBase()` in `src/services/knowledgeEntryService.ts`.
-**What a junior would likely miss:** The route does not know the ranking algorithm; it only validates input and delegates.
+## Step 5: `src/lib/validation/knowledgeEntrySchemas.ts`
+**Why read this:** It defines the request contracts.
+**What to look for:** The slug transform and refine (`:45-54`), the `manualBoost` cap (`:63`), and `featuredOnly: z.coerce.boolean()` (`:26`).
+**What to trace:** The search, knowledge, status, curation, and workspace routes.
+**What a junior would likely miss:** `z.coerce.boolean()` turns the string `"false"` into `true`.
+**Check:** Find the field with no maximum length. Answer: `content` (`:42`).
 
-## Step 7 — src/services/knowledgeEntryService.ts
-**Why read this:** This is the most important backend file because it owns business rules and transactions.
-**What to look for:** `createDraftEntry()`, `changeEntryStatus()`, and `curateEntry()`.
-**What to trace:** Routes in `src/app/api/knowledge/**` call it; it calls repositories in `src/repositories/knowledgeEntryRepository.ts`, `src/repositories/tagRepository.ts`, and `src/repositories/auditLogRepository.ts`.
-**What a junior would likely miss:** The service layer is where permission checks, workflow rules, and transactional side effects belong together.
+## Step 6: `src/app/api/knowledge/search/route.ts`
+**Why read this:** It is the cleanest read-only route.
+**What to look for:** Auth first (`:21`), then manual extraction of the query string into the schema (`:23-29`), then the service.
+**What to trace:** `searchKnowledgeBase` and `searchPublishedEntries`.
+**What a junior would likely miss:** `getAll("tags")` supports repeated parameters. A comma-separated value would be treated as one slug.
+**Check:** Name the error code for `?page=0`. Answer: 400 `INVALID_REQUEST` (`min(1)`, `knowledgeEntrySchemas.ts:27`).
 
-## Step 8 — src/repositories/knowledgeEntryRepository.ts
-**Why read this:** It shows both standard CRUD queries and a realistic escape hatch into raw SQL for ranked search.
-**What to look for:** `searchPublishedEntries()`, `listWorkspaceEntries()`, and the ownership-scoped `where` clause.
-**What to trace:** `src/services/knowledgeEntryService.ts` calls it for all entry reads and writes; it calls Prisma through `src/lib/db.ts`.
-**What a junior would likely miss:** Search ranking is intentionally implemented here, not in the service or UI, because query shape is a data-access concern.
+## Step 7: `src/services/knowledgeEntryService.ts`
+**Why read this:** It holds every entry rule.
+**What to look for:**
+- `createDraftEntry` (`:83-119`);
+- `updateDraftEntry` (`:121-161`). Note that it has no status check;
+- `changeEntryStatus` (`:163-195`);
+- `curateEntry` (`:197-232`).
+**What to trace:** Repository writes and `createAuditLog`, which always receives the `transaction` client.
+**What a junior would likely miss:** Uniqueness pre-checks run **outside** the transaction (`:88`, `:132`).
+**Check:** Find the action strings written to `AuditLog`. Answer: `knowledgeEntry.created`, `.updated`, `.statusChanged`, and `.curated`.
 
-## Step 9 — src/components/knowledge/search-dashboard.tsx
-**Why read this:** It shows how the UI stays thin while still offering a polished search experience.
-**What to look for:** Local filter state and the handoff into `useKnowledgeSearch()`.
-**What to trace:** It calls `useKnowledgeSearch()` and `useTags()` from `src/hooks`; it is rendered by `src/app/page.tsx`.
-**What a junior would likely miss:** The component controls filters, but it does not decide ranking or permissions.
+## Step 8: `src/repositories/knowledgeEntryRepository.ts`
+**Why read this:** It has both Prisma CRUD and raw SQL.
+**What to look for:** Three scoped finders (`:34-105`), `listWorkspaceEntries` (`:116-156`), `searchPublishedEntries` (`:158-264`), and `mapWorkspaceEntry` (`:404-425`).
+**What to trace:** Callers are only in `knowledgeEntryService.ts`.
+**What a junior would likely miss:** The ranking document in SQL includes tag names. The GIN index in the migration does not, so the index cannot serve this query.
+**Check:** Compute the score of a featured entry with boost 5 and no text query. Answer: `0 + 1.5 + 0.75 = 2.25` (`:244-248`).
 
-## Step 10 — src/hooks/useKnowledgeSearch.ts
-**Why read this:** It is the bridge between UI filter state and the REST API.
-**What to look for:** Query key construction and URLSearchParams generation.
-**What to trace:** It is called by `src/components/knowledge/search-dashboard.tsx` and calls `apiClient()` in `src/lib/http/client.ts`.
-**What a junior would likely miss:** Cache keys must include the real filters, or search results will become stale and misleading.
+## Step 9: `src/components/knowledge/search-dashboard.tsx`
+**Why read this:** It is a thin search UI.
+**What to look for:** Filter state, tag chips toggling slugs (`:66-82`), and result links (`:140`).
+**What to trace:** `useKnowledgeSearch` and `useTags`.
+**Check:** Explain why tag chips use `tag.slug` rather than `tag.name`. Answer: the SQL filters on `Tag.slug` (`knowledgeEntryRepository.ts:170`).
 
-## Step 11 — src/components/knowledge/workspace-dashboard.tsx
-**Why read this:** It is the best example of a client surface that orchestrates many mutations without owning backend policy.
-**What to look for:** `WorkspaceEditorPanel`, the selected-entry model, and mutation calls like `useChangeEntryStatusMutation()`.
-**What to trace:** It calls hooks from `src/hooks/useWorkspaceEntries.ts`, `src/hooks/useWorkspaceEntry.ts`, and `src/hooks/useEntryMutations.ts`; it is rendered by `src/app/workspace/page.tsx`.
-**What a junior would likely miss:** The component is busy, but all meaningful permission and transition rules still live on the server.
+## Step 10: `src/hooks/useKnowledgeSearch.ts`
+**Why read this:** It bridges UI state and the API.
+**What to look for:** Conditional parameters (`:17-28`) and the query key (`:31`).
+**Check:** Explain what makes the cache key change when a tag is toggled. Answer: the `filters` object, including the `tags` array, is part of the key.
 
-## Step 12 — prisma/schema.prisma
-**Why read this:** It is the canonical model for roles, sessions, entries, tags, and audit logs.
-**What to look for:** `EntryStatus`, `UserRole`, `KnowledgeEntry`, and `AuditLog`.
-**What to trace:** Prisma Client usage in `src/repositories/*` depends on this file; `prisma/seed.ts` uses the generated enums directly.
-**What a junior would likely miss:** Search and workflow features are reflected in schema fields like `manualBoost`, `isFeatured`, and `publishedAt`, not added as ad hoc JSON later.
+## Step 11: `src/components/knowledge/workspace-dashboard.tsx`
+**Why read this:** It runs many mutations without holding server policy.
+**What to look for:** The create/update branch (`:115-120`), status buttons (`:185-232`), and the admin-only curation form (`:275`).
+**What a junior would likely miss:** The Publish button condition (`status !== "PUBLISHED"`) also matches `ARCHIVED`, which the server rejects.
+**Check:** Find the button an admin sees only on archived entries. Answer: the restore-to-draft button (`:225-232`).
 
-## Step 13 — prisma/seed.ts
-**Why read this:** It shows the intended runtime shape of the system through concrete demo data.
-**What to look for:** Seeded roles, published vs draft entries, and tag assignment.
-**What to trace:** It uses generated Prisma types from `@prisma/client` and maps directly to the login UI in `src/components/auth/login-form.tsx`.
-**What a junior would likely miss:** Seed data should exercise the real states and roles your product depends on, not just create generic placeholder rows.
+## Step 12: `prisma/schema.prisma` and `prisma/migrations/.../migration.sql`
+**Why read this:** They are the persistence contract.
+**What to look for:** `EntryStatus`, `UserRole`, the curation fields on `KnowledgeEntry`, and the unique `Tag.name` and `Tag.slug`. In the migration, the GIN index (`:112-120`).
+**What a junior would likely miss:** `db:push` would skip the hand-written GIN index.
+**Check:** Find the `onDelete` behavior that prevents deleting an author. Answer: `onDelete: Restrict` on `KnowledgeEntry.author` (`schema.prisma:74`).
+
+## Step 13: `prisma/seed.ts`
+**Why read this:** It shows the intended runtime shape.
+**What to look for:** Three users (`:7-38`), five tags (`:41-46`), two published entries by the editor, and one draft by the admin with `manualBoost: 1` (`:139-141`).
+**Check:** Explain why re-running the seed does not duplicate rows. Answer: every write is an `upsert` keyed by email or slug.
